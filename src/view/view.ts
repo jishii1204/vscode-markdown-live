@@ -63,6 +63,19 @@ declare function acquireVsCodeApi(): {
 
 const vscode = acquireVsCodeApi();
 
+function toggleTaskMarker(
+	markdown: string,
+	taskIndex: number,
+	checked: boolean,
+): string {
+	let index = -1;
+	return markdown.replace(/^\s*(?:[-+*]|\d+[.)])\s+\[[ xX]\]/gm, (marker) =>
+		++index === taskIndex
+			? marker.replace(/\[[ xX]\]/, `[${checked ? 'x' : ' '}]`)
+			: marker,
+	);
+}
+
 // Global error handler — show errors visually in the webview
 function showError(msg: string): void {
 	console.error(`[view] ${msg}`);
@@ -87,6 +100,7 @@ let syncDebugSeq = 0;
 // We compare against the normalized baseline to detect real user changes.
 // This prevents the file from being dirtied just by opening it in the editor.
 let normalizedBaseline = '';
+let sourceMarkdown = '';
 let isInitializing = false;
 
 // Debounce timer for sending updates to the extension host.
@@ -161,9 +175,58 @@ const syncPlugin = $prose((ctx) => {
 						});
 						vscode.postMessage({ type: 'update', body: md });
 						normalizedBaseline = md;
+						sourceMarkdown = md;
 					}, UPDATE_DELAY_MS);
 				},
 			};
+		},
+	});
+});
+
+const taskListTogglePlugin = $prose(() => {
+	return new Plugin({
+		props: {
+			handleDOMEvents: {
+				click(view, event) {
+					const listItem = event.target;
+					if (
+						!(listItem instanceof HTMLLIElement) ||
+						!listItem.hasAttribute('data-checked') ||
+						event.offsetX >
+							Number.parseFloat(getComputedStyle(listItem, '::before').width)
+					) {
+						return false;
+					}
+
+					const taskIndex = [
+						...view.dom.querySelectorAll('li[data-checked]'),
+					].indexOf(listItem);
+					const checked = listItem.dataset.checked !== 'true';
+					const nextMarkdown = toggleTaskMarker(
+						sourceMarkdown,
+						taskIndex,
+						checked,
+					);
+					if (nextMarkdown === sourceMarkdown) return false;
+					const preserveSource = updateTimer === null;
+
+					event.preventDefault();
+					view.dispatch(
+						view.state.tr.setNodeAttribute(
+							view.posAtDOM(listItem, 0) - 1,
+							'checked',
+							checked,
+						),
+					);
+					view.focus();
+					if (!preserveSource) return true;
+					if (updateTimer) clearTimeout(updateTimer);
+					updateTimer = null;
+					sourceMarkdown = nextMarkdown;
+					vscode.postMessage({ type: 'update', body: nextMarkdown });
+					return true;
+				},
+			},
 		},
 	});
 });
@@ -289,6 +352,7 @@ async function createEditor(
 	markdown: string,
 ): Promise<Editor> {
 	isInitializing = true;
+	sourceMarkdown = markdown;
 
 	const instance = Editor.make()
 		.config((ctx) => {
@@ -297,6 +361,7 @@ async function createEditor(
 		})
 		.use(commonmark)
 		.use(gfm)
+		.use(taskListTogglePlugin)
 		.use(tableBlock)
 		.config(configureTableBlock)
 		.use(remarkFrontmatterPlugin)
@@ -357,6 +422,7 @@ function replaceContent(newMarkdown: string): void {
 	if (!editor) {
 		return;
 	}
+	sourceMarkdown = newMarkdown;
 	isUpdatingFromExtension = true;
 	try {
 		editor.action((ctx) => {
