@@ -4,6 +4,7 @@ import {
 	editorStateCtx,
 	editorViewCtx,
 	parserCtx,
+	remarkCtx,
 	rootCtx,
 	serializerCtx,
 } from '@milkdown/core';
@@ -47,6 +48,7 @@ import { mountSearchPanel } from './searchPanel';
 import { searchPlugin } from './searchPlugin';
 import { configureSlash, slash, slashKeyboardPlugin } from './slashPlugin';
 import { configureTableBlock, tableBlock } from './tableBlockPlugin';
+import { toggleTaskMarker } from './taskListLogic';
 import {
 	configureCustomLinkTooltip,
 	configureSelectionToolbar,
@@ -63,16 +65,25 @@ declare function acquireVsCodeApi(): {
 
 const vscode = acquireVsCodeApi();
 
-function toggleTaskMarker(
-	markdown: string,
-	taskIndex: number,
-	checked: boolean,
-): string {
-	let index = -1;
-	return markdown.replace(/^\s*(?:[-+*]|\d+[.)])\s+\[[ xX]\]/gm, (marker) =>
-		++index === taskIndex
-			? marker.replace(/\[[ xX]\]/, `[${checked ? 'x' : ' '}]`)
-			: marker,
+function isTaskCheckboxClick(
+	listItem: HTMLElement,
+	event: MouseEvent,
+): boolean {
+	const markerStyle = getComputedStyle(listItem, '::before');
+	const markerTop = Number.parseFloat(markerStyle.top);
+	const markerWidth =
+		Number.parseFloat(markerStyle.width) +
+		Number.parseFloat(markerStyle.borderLeftWidth) +
+		Number.parseFloat(markerStyle.borderRightWidth);
+	const markerHeight =
+		Number.parseFloat(markerStyle.height) +
+		Number.parseFloat(markerStyle.borderTopWidth) +
+		Number.parseFloat(markerStyle.borderBottomWidth);
+
+	return (
+		event.offsetX <= markerWidth &&
+		event.offsetY >= markerTop &&
+		event.offsetY <= markerTop + markerHeight
 	);
 }
 
@@ -183,7 +194,7 @@ const syncPlugin = $prose((ctx) => {
 	});
 });
 
-const taskListTogglePlugin = $prose(() => {
+const taskListTogglePlugin = $prose((ctx) => {
 	return new Plugin({
 		props: {
 			handleDOMEvents: {
@@ -192,8 +203,7 @@ const taskListTogglePlugin = $prose(() => {
 					if (
 						!(listItem instanceof HTMLLIElement) ||
 						!listItem.hasAttribute('data-checked') ||
-						event.offsetX >
-							Number.parseFloat(getComputedStyle(listItem, '::before').width)
+						!isTaskCheckboxClick(listItem, event)
 					) {
 						return false;
 					}
@@ -202,13 +212,16 @@ const taskListTogglePlugin = $prose(() => {
 						...view.dom.querySelectorAll('li[data-checked]'),
 					].indexOf(listItem);
 					const checked = listItem.dataset.checked !== 'true';
-					const nextMarkdown = toggleTaskMarker(
-						sourceMarkdown,
-						taskIndex,
-						checked,
-					);
-					if (nextMarkdown === sourceMarkdown) return false;
 					const preserveSource = updateTimer === null;
+					const nextMarkdown = preserveSource
+						? toggleTaskMarker(
+								sourceMarkdown,
+								ctx.get(remarkCtx).parse(sourceMarkdown),
+								taskIndex,
+								checked,
+							)
+						: sourceMarkdown;
+					if (preserveSource && nextMarkdown === sourceMarkdown) return false;
 
 					event.preventDefault();
 					view.dispatch(
@@ -222,6 +235,9 @@ const taskListTogglePlugin = $prose(() => {
 					if (!preserveSource) return true;
 					if (updateTimer) clearTimeout(updateTimer);
 					updateTimer = null;
+					normalizedBaseline = cleanupTableBr(
+						ctx.get(serializerCtx)(view.state.doc),
+					);
 					sourceMarkdown = nextMarkdown;
 					vscode.postMessage({ type: 'update', body: nextMarkdown });
 					return true;
@@ -422,7 +438,6 @@ function replaceContent(newMarkdown: string): void {
 	if (!editor) {
 		return;
 	}
-	sourceMarkdown = newMarkdown;
 	isUpdatingFromExtension = true;
 	try {
 		editor.action((ctx) => {
@@ -433,6 +448,7 @@ function replaceContent(newMarkdown: string): void {
 			);
 
 			if (currentMarkdown === newMarkdown) {
+				sourceMarkdown = newMarkdown;
 				syncDebug('replace-skip-equal', {
 					incomingLength: newMarkdown.length,
 					incomingHash: hashText(newMarkdown),
@@ -455,6 +471,7 @@ function replaceContent(newMarkdown: string): void {
 			const { tr } = view.state;
 			tr.replaceWith(0, view.state.doc.content.size, newDoc.content);
 			view.dispatch(tr);
+			sourceMarkdown = newMarkdown;
 
 			// Update baseline to the new normalized content
 			const updatedDoc = ctx.get(editorStateCtx).doc;
